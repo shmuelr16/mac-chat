@@ -18,6 +18,7 @@
 - **עברית מימין לשמאל:** הודעות בעברית מיושרות לימין ונקראות נכון, גם כשיש בהן מילים באנגלית.
 - **תשובות בזמן אמת:** התשובה נכתבת תוך כדי, עם עיצוב לכותרות, רשימות, **הדגשות** ובלוקי קוד.
 - **המפתח שמור ב-Keychain:** בהפעלה הראשונה נפתח חלון של macOS להזנת המפתח. המפתח לא נשמר בשום קובץ.
+- **גישה למחשב:** ה-AI יכול להריץ פקודות, ליצור ולערוך קבצים ותיקיות, ולכתוב קוד. כל פעולה מחכה לאישור שלך.
 - **בלי תלויות:** קובץ Node אחד, בלי `npm install`.
 
 ## דרישות
@@ -61,6 +62,33 @@ ai "מה זה closure ב-JavaScript?"
 ai --key
 ```
 
+## גישה למחשב
+
+אפשר לבקש מה-AI לעבוד על המחשב, למשל:
+
+- "צור תיקייה בשם site ובתוכה דף HTML עם כפתור"
+- "מה תופס מקום בתיקיית ההורדות?"
+- "תתקן את הבאג ב-app.js ותריץ את הבדיקות"
+
+**מה הוא יכול לעשות:** להריץ פקודות zsh, לקרוא קבצים, ליצור ולערוך קבצים ותיקיות, ולראות מה יש בתיקייה.
+
+**איפה:** העבודה מתחילה בתיקייה שממנה הרצת `ai`. התיקייה הנוכחית מוצגת בשורה העליונה. אם הוא מריץ `cd`, התיקייה מתעדכנת.
+
+**אישורים:** קריאת קבצים ורשימת תיקיות לא דורשות אישור. לפני כל פקודה וכל כתיבה או עריכה של קובץ מוצג מה בדיוק עומד לקרות: הפקודה, תוכן הקובץ, או השורות שמשתנות. אחר כך הוא מחכה לתשובה שלך:
+
+| מקש | פעולה |
+|---|---|
+| `y` או Enter | לאשר |
+| `n` | לדחות. ה-AI יקבל הודעה שדחית |
+| `a` | לאשר הכל עד סוף השיחה |
+| Esc | לעצור את כל הפעולה |
+
+המקשים עובדים גם כשהמקלדת בעברית (ט, מ, ש).
+
+`/auto` מפעיל ומכבה אישור אוטומטי. כשהוא פעיל, למעלה מוצג `AUTO` והפעולות רצות בלי לשאול. האישור האוטומטי לא נשמר ליציאה הבאה.
+
+> ⚠️ ה-AI מריץ פקודות אמיתיות עם ההרשאות שלך. קרא כל פקודה לפני שאתה מאשר, במיוחד `rm`, ואל תפעיל `/auto` בתיקייה עם קבצים חשובים.
+
 ## שימוש
 
 | פקודה | מה היא עושה |
@@ -68,6 +96,7 @@ ai --key
 | `/new` | שיחה חדשה |
 | `/model` | בחירת מודל חינמי מהרשימה |
 | `/copy` | העתקת התשובה האחרונה |
+| `/auto` | אישור אוטומטי לפעולות (הפעלה/כיבוי) |
 | `/key` | החלפת מפתח ה-API |
 | `/help` | עזרה |
 | `/exit` | יציאה |
@@ -103,7 +132,7 @@ rm -rf ~/.config/mac-chat ~/mac-chat
 
 ### English
 
-A fullscreen, history-free terminal chat for **macOS only**, using free [OpenRouter](https://openrouter.ai) models. It is a single Node.js file with no dependencies. The API key is entered in a native macOS dialog and stored in the Keychain. The interface is in Hebrew, with right-to-left rendering.
+A fullscreen, history-free terminal chat for **macOS only**, using free [OpenRouter](https://openrouter.ai) models. The AI can run shell commands and create or edit files and folders, and every command or file change waits for your approval. It is a single Node.js file with no dependencies. The API key is entered in a native macOS dialog and stored in the Keychain. The interface is in Hebrew, with right-to-left rendering.
 
 ```bash
 git clone https://github.com/shmuelr16/mac-chat.git ~/mac-chat && ~/mac-chat/install.sh

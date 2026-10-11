@@ -2,9 +2,10 @@
 // mac-chat: a fullscreen terminal chat over OpenRouter's free models.
 // Runs on the alternate screen and redraws every frame, so nothing lands in the scrollback.
 // The API key lives in the macOS Keychain; set-key.sh asks for it in a native dialog.
+// The model can run shell commands and read/write files; risky actions wait for the user's approval.
 
-import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -17,9 +18,7 @@ const AUTO_MODEL = 'openrouter/free';
 const DEFAULT_MODEL = 'google/gemma-4-31b-it:free';
 // Tried in order when the chosen free model is busy or down.
 const FALLBACK_MODELS = [DEFAULT_MODEL, 'nvidia/nemotron-3-super-120b-a12b:free', AUTO_MODEL];
-const SYSTEM_PROMPT =
-  "You are a helpful assistant inside a terminal chat app. Reply in the user's language. " +
-  'Be clear and concise. Light markdown is rendered: **bold**, `code`, lists, headings and fenced code blocks. Avoid tables.';
+const MAX_STEPS = 30; // model calls per user message
 
 const out = process.stdout;
 const stdin = process.stdin;
@@ -320,7 +319,14 @@ const renderPlain = (text, width) =>
 
 const state = {
   config: { model: DEFAULT_MODEL },
-  messages: [], // { role: 'user' | 'assistant' | 'note', content, model?, error?, stopped?, thinking?, rtlHint? }
+  // user/note: { content }; assistant: { content, model, toolCalls, error?, stopped? }; tool: { callId, name, args, status, result }
+  messages: [],
+  cwd: process.cwd(),
+  busy: false, // a user message is being worked on (model calls + tools)
+  cancel: false,
+  running: null, // { kill } for the shell command in progress
+  approval: null, // { tool, resolve } while waiting for y/n/a
+  autoApprove: false,
   input: '',
   cursor: 0,
   pasting: false,
@@ -340,6 +346,7 @@ const COMMANDS = [
   ['/new', 'שיחה חדשה'],
   ['/model', 'בחירת מודל'],
   ['/copy', 'העתקת התשובה האחרונה'],
+  ['/auto', 'אישור אוטומטי לפעולות'],
   ['/key', 'החלפת מפתח'],
   ['/help', 'עזרה'],
   ['/exit', 'יציאה'],
@@ -390,12 +397,19 @@ function labelTokens(m, live) {
 
 // A message is a colored stripe + label + body; Hebrew messages mirror, with the stripe on the right.
 function messageLines(m, width) {
+  if (m.role === 'tool') return toolLines(m, width);
   const live = state.stream?.msg === m;
+  // A reply that only called tools is shown through its tool cards.
+  if (m.role === 'assistant' && !live && !m.content && !m.error && !m.stopped) return [];
   const bodyW = width - 2;
   let body;
   if (!live && m.cache?.width === width) body = m.cache.lines;
   else {
-    if (live && !m.content) body = [toLine([{ t: he(m.thinking ? 'חושב…' : 'מתחבר…'), s: DIM + ITALIC }])];
+    if (live && !m.content) {
+      const calling = m.toolCalls?.find(Boolean)?.name;
+      const text = calling ? `מכין פעולה: ${calling}` : m.thinking ? 'חושב…' : 'מתחבר…';
+      body = [toLine([{ t: he(text), s: DIM + ITALIC }])];
+    }
     else if (m.role === 'user') body = renderPlain(m.content, bodyW);
     else body = renderMarkdown(m.content + (live ? '▍' : ''), bodyW);
     if (m.error) body = [...body, ...paragraph([{ t: '✗ ' + m.error, s: fg(RED) }], bodyW)];
@@ -418,12 +432,66 @@ function messageLines(m, width) {
   ];
 }
 
+const fit = (s, w) => (textWidth(s) <= w ? s : hardWrap(s, w - 1)[0] + '…');
+
+function previewLines(lines, width, style = '', max = 8) {
+  const shown = lines.slice(0, max).map((l) => codeLine(fit(l.replace(/\t/g, '  '), width - 2), width, style));
+  if (lines.length > max) shown.push(codeLine(he(`… עוד ${lines.length - max} שורות`), width, DIM));
+  return shown;
+}
+
+function outputTail(output, width, max = 6) {
+  const lines = output.replace(/\n+$/, '').split('\n');
+  if (lines.length <= max) return previewLines(lines, width, DIM, max);
+  return [codeLine(he(`… ${lines.length - max} שורות קודמות`), width, DIM), ...previewLines(lines.slice(-max), width, DIM, max)];
+}
+
+// A tool card: what the model wants to do, its status, and a short preview (command, diff, output).
+function toolLines(m, width) {
+  const a = m.args || {};
+  const bodyW = width - 2;
+  const failed = m.status === 'error' || (m.status === 'done' && m.exitCode != null && m.exitCode !== 0);
+  const color = m.status === 'pending' ? AMBER : failed ? RED : m.status === 'denied' ? [120, 120, 140] : CYAN;
+  const verb = { run_command: '$', read_file: 'read', write_file: 'write', edit_file: 'edit', list_dir: 'ls' }[m.name] ?? m.name;
+  const target = m.name === 'run_command' ? String(a.command ?? '') : displayPath(resolvePath(a.path));
+  const firstLine = target.split('\n')[0] + (target.includes('\n') ? ' …' : '');
+  const status =
+    {
+      pending: [{ t: '  ' + he('ממתין לאישור'), s: fg(AMBER) }],
+      running: [{ t: `  ${spinner()} ${Math.floor((Date.now() - m.start) / 1000)}s`, s: fg(VIOLET) }],
+      done: failed
+        ? [{ t: `  ✗ exit ${m.exitCode}`, s: fg(RED) }]
+        : [{ t: '  ✓', s: fg(GREEN) }, ...(m.summary ? [{ t: ' ' + he(m.summary), s: DIM }] : [])],
+      error: [{ t: '  ✗', s: fg(RED) }],
+      denied: [{ t: '  ' + he('בוטל'), s: DIM }],
+    }[m.status] ?? [];
+  const head = wrapTokens([{ t: verb + ' ', s: BOLD + fg(color) }, { t: firstLine, s: BOLD }, ...status], bodyW).map(toLine);
+
+  let body = [];
+  if (m.status === 'error') body = paragraph([{ t: m.error, s: fg(RED) }], bodyW);
+  else if (m.name === 'run_command') {
+    if (m.status === 'pending' && target.includes('\n')) body = previewLines(target.split('\n'), bodyW, '', 12);
+    else if (m.output && (m.status === 'done' || m.status === 'denied')) body = outputTail(m.output, bodyW);
+  } else if (m.name === 'write_file' && m.status === 'pending') {
+    body = previewLines(String(a.content ?? '').split('\n'), bodyW, '', 10);
+  } else if (m.name === 'edit_file' && m.status === 'pending') {
+    const minus = String(a.old_text ?? '').split('\n').map((l) => '- ' + l);
+    const plus = String(a.new_text ?? '').split('\n').map((l) => '+ ' + l);
+    body = [...previewLines(minus, bodyW, fg(RED), 8), ...previewLines(plus, bodyW, fg(GREEN), 8)];
+  }
+
+  const bar = fg(color) + '▌' + RESET + ' ';
+  return [...head, ...body].map((l) => ({ s: bar + l.s, w: l.w + 2 }));
+}
+
 function chatRows(colW, areaH, left, W) {
   const lines = [EMPTY];
-  state.messages.forEach((m, i) => {
-    if (i) lines.push(EMPTY);
-    lines.push(...messageLines(m, colW));
-  });
+  for (const m of state.messages) {
+    const group = messageLines(m, colW);
+    if (!group.length) continue;
+    if (lines.length > 1) lines.push(EMPTY);
+    lines.push(...group);
+  }
   state.maxScroll = Math.max(0, lines.length - areaH);
   state.scroll = Math.min(state.scroll, state.maxScroll);
   const start = state.maxScroll - state.scroll;
@@ -448,7 +516,12 @@ function splashRows(W, areaH) {
   const lines = [];
   if (W >= LOGO_W + 4 && areaH >= LOGO.length + 6) lines.push(...LOGO.map((row) => ({ s: shimmer(row, phase), w: LOGO_W })));
   else lines.push({ s: gradient('◆ mac-chat', phase, BOLD), w: 10 });
-  lines.push(EMPTY, toLine([{ t: he('צ׳אט בינה מלאכותית חינמי, ישר מהטרמינל'), s: DIM }]), EMPTY);
+  lines.push(
+    EMPTY,
+    toLine([{ t: he('צ׳אט בינה מלאכותית חינמי, ישר מהטרמינל'), s: DIM }]),
+    toLine([{ t: he('מריץ פקודות, יוצר ועורך קבצים ומתכנת, באישור שלך'), s: DIM }]),
+    EMPTY,
+  );
   lines.push(
     toLine([
       { t: 'Enter', s: fg(PINK) },
@@ -510,25 +583,42 @@ function pickerRows(colW, areaH, left) {
 function headerRow(W) {
   const title = ' ' + gradient('◆ mac-chat', null, BOLD);
   const badge = toLine([
+    ...(state.autoApprove ? [{ t: ' AUTO ', s: bg(AMBER) + fg([20, 20, 20]) + BOLD }, { t: '  ', s: '' }] : []),
     { t: '● ', s: fg(GREEN) },
     { t: shortModel(state.config.model), s: BOLD + fg(CYAN) },
     { t: ' · free ', s: DIM },
   ]);
-  const gap = W - 11 - badge.w;
-  return title + (gap > 2 ? ' '.repeat(gap) + badge.s : '');
+  const room = W - 11 - badge.w - 6;
+  let cwd = tildify(state.cwd);
+  if (textWidth(cwd) > room) cwd = room > 4 ? '…' + cwd.slice(-(room - 1)) : '';
+  const gap = W - 11 - 2 - textWidth(cwd) - badge.w;
+  return title + '  ' + DIM + cwd + RESET + (gap > 1 ? ' '.repeat(gap) + badge.s : '');
 }
 
-const ruleRow = (W) => gradient('─'.repeat(W), state.stream ? (state.frame * 0.03) % 1 : null);
+const ruleRow = (W) => gradient('─'.repeat(W), state.busy ? (state.frame * 0.03) % 1 : null);
 
 function statusRow(colW, left) {
   let tokens = [];
   const typingCommand = /^\/\S*$/.test(state.input);
   const matches = typingCommand ? COMMANDS.filter(([c]) => c.startsWith(state.input)) : [];
-  if (matches.length) {
+  if (state.approval) {
+    tokens = [
+      { t: '● ', s: fg(AMBER) },
+      { t: he('לאשר את הפעולה?') + '    ', s: BOLD + fg(AMBER) },
+      { t: 'y', s: BOLD + fg(PINK) },
+      { t: ' ' + he('כן') + '   ', s: DIM },
+      { t: 'n', s: BOLD + fg(PINK) },
+      { t: ' ' + he('לא') + '   ', s: DIM },
+      { t: 'a', s: BOLD + fg(PINK) },
+      { t: ' ' + he('כן לכל השיחה') + '   ', s: DIM },
+      { t: 'Esc', s: BOLD + fg(PINK) },
+      { t: ' ' + he('עצירה'), s: DIM },
+    ];
+  } else if (matches.length) {
     matches.forEach(([c, d], i) => tokens.push({ t: c, s: fg(PINK) + (i ? '' : BOLD) }, { t: ' ' + he(d) + '   ', s: DIM }));
     tokens.push({ t: 'Tab', s: fg(CYAN) });
   } else if (state.toast) tokens = [{ t: he(state.toast.text), s: fg(state.toast.color) }];
-  else if (state.stream) tokens = [{ t: 'Esc', s: fg(PINK) }, { t: ' ' + he('לעצירה'), s: DIM }];
+  else if (state.busy) tokens = [{ t: 'Esc', s: fg(PINK) }, { t: ' ' + he('לעצירה'), s: DIM }];
   const l = toLine(tokens);
   const r = state.scroll > 0 ? toLine([{ t: he(`↓ עוד ${state.scroll} שורות`), s: fg(CYAN) }]) : EMPTY;
   const gap = colW - 2 - l.w - r.w;
@@ -601,7 +691,7 @@ function render() {
 
   // input box
   const margin = ' '.repeat(left);
-  const border = state.stream ? DIM + fg(VIOLET) : fg(VIOLET);
+  const border = state.approval ? fg(AMBER) : state.busy ? DIM + fg(VIOLET) : fg(VIOLET);
   const rtlInput = isRtl(state.input);
   rows.push(margin + border + '╭' + '─'.repeat(colW - 2) + '╮' + RESET);
   inputRows.forEach((text, i) => {
@@ -609,14 +699,24 @@ function render() {
     const w = input.widths[inputTop + i];
     let content;
     if (!state.input) {
-      const hint = toLine([{ t: he(state.stream ? 'ממתין לתשובה…' : 'שאל אותי משהו…'), s: DIM + ITALIC }]);
+      const text = state.approval ? 'ממתין לאישור שלך…' : state.busy ? 'עובד על זה…' : 'שאל אותי משהו…';
+      const hint = toLine([{ t: he(text), s: DIM + ITALIC }]);
       content = hint.s + ' '.repeat(innerW - hint.w);
     } else if (rtlInput) content = ' '.repeat(innerW - w) + `⁧${text}⁩`;
     else content = text + ' '.repeat(innerW - w);
     rows.push(margin + border + '│' + RESET + ' ' + prompt + ' ' + content + ' ' + border + '│' + RESET);
   });
   const hints = toLine(
-    state.stream
+    state.approval
+      ? [
+          { t: 'y', s: fg(PINK) },
+          { t: ' ' + he('כן') + ' · ', s: DIM },
+          { t: 'n', s: fg(PINK) },
+          { t: ' ' + he('לא') + ' · ', s: DIM },
+          { t: 'a', s: fg(PINK) },
+          { t: ' ' + he('תמיד'), s: DIM },
+        ]
+      : state.busy
       ? [{ t: 'Esc', s: fg(PINK) }, { t: ' ' + he('עצירה'), s: DIM }]
       : [
           { t: 'Enter', s: fg(PINK) },
@@ -634,7 +734,7 @@ function render() {
   );
 
   let cursor = null;
-  if (!state.stream && !state.picker) {
+  if (!state.busy && !state.picker) {
     const [row, col] = input.cursor;
     const x = rtlInput && state.input ? Math.max(0, innerW - 1 - col) : Math.min(col, innerW);
     cursor = [H - boxH + 2 + (row - inputTop), left + 5 + x];
@@ -663,15 +763,46 @@ function describeError(status, body) {
   return `שגיאה ${status}${detail ? `: ${detail}` : ''}`;
 }
 
-async function ask(rtlHint) {
-  const history = state.messages
-    .filter((m) => m.role !== 'note' && m.content && !m.error)
-    .map(({ role, content }) => ({ role, content }));
-  const msg = { role: 'assistant', content: '', model: '', rtlHint };
+const systemPrompt = () =>
+  [
+    "You are mac-chat, an AI assistant in a terminal on the user's Mac (macOS, zsh).",
+    'You have tools to run shell commands and to read, create and edit files and folders. The user approves risky actions in the UI.',
+    `Working directory: ${state.cwd}. Home: ${homedir()}. Today: ${new Date().toISOString().slice(0, 10)}.`,
+    "Reply in the user's language, clearly and concisely. Light markdown is rendered (bold, `code`, lists, headings, fenced code). Avoid tables.",
+    'Use tools only when the request needs the computer or files; otherwise just answer.',
+    'Read a file before editing it. Use edit_file for small changes and write_file for new files or full rewrites.',
+    'Relative paths resolve against the working directory, and `cd` in run_command persists.',
+    'Commands get no stdin: avoid interactive programs and pagers, and start servers in the background (nohup … &).',
+    'Do not delete or overwrite anything the user did not ask about. After acting, briefly say what you did.',
+  ].join('\n');
+
+// History in OpenAI format. Every tool call is paired with its tool message.
+function apiMessages() {
+  const msgs = [];
+  for (const m of state.messages) {
+    if (m.role === 'user') msgs.push({ role: 'user', content: m.content });
+    else if (m.role === 'tool') msgs.push({ role: 'tool', tool_call_id: m.callId, content: m.result });
+    else if (m.role === 'assistant' && (m.content || m.toolCalls.length)) {
+      const msg = { role: 'assistant', content: m.content };
+      if (m.toolCalls.length)
+        msg.tool_calls = m.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: tc.arguments || '{}' },
+        }));
+      msgs.push(msg);
+    }
+  }
+  return msgs;
+}
+
+// One model call, streamed into a new assistant message.
+async function complete(rtlHint) {
+  const messages = [{ role: 'system', content: systemPrompt() }, ...apiMessages()];
+  const msg = { role: 'assistant', content: '', model: '', rtlHint, toolCalls: [] };
   const ctrl = new AbortController();
   state.messages.push(msg);
   state.stream = { msg, ctrl, start: Date.now() };
-  state.scroll = 0;
   render();
 
   try {
@@ -682,7 +813,8 @@ async function ask(rtlHint) {
       body: JSON.stringify({
         models: [state.config.model, ...FALLBACK_MODELS.filter((id) => id !== state.config.model)].slice(0, 3),
         stream: true,
-        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history],
+        messages,
+        tools: TOOLS,
       }),
     });
     if (!res.ok) throw new Error(describeError(res.status, await res.text()));
@@ -709,6 +841,14 @@ async function ask(rtlHint) {
         const delta = event.choices?.[0]?.delta ?? {};
         if (delta.reasoning) msg.thinking = true;
         if (delta.content) msg.content += delta.content;
+        for (const tc of delta.tool_calls ?? []) {
+          const i = tc.index ?? (tc.id || !msg.toolCalls.length ? msg.toolCalls.length : msg.toolCalls.length - 1);
+          const slot = (msg.toolCalls[i] ??= { id: '', name: '', arguments: '' });
+          if (tc.id) slot.id = tc.id;
+          if (tc.function?.name) slot.name ||= tc.function.name;
+          const args = tc.function?.arguments;
+          if (args) slot.arguments += typeof args === 'string' ? args : JSON.stringify(args);
+        }
         queueRender();
       }
     }
@@ -717,17 +857,249 @@ async function ask(rtlHint) {
     else msg.error = err.message === 'fetch failed' ? 'אין חיבור לאינטרנט' : err.message;
   }
   state.stream = null;
-  if (!msg.content && !msg.error && !msg.stopped) msg.error = 'התקבלה תשובה ריקה. נסה שוב, או בחר מודל אחר ב-/model';
+  msg.toolCalls = msg.stopped || msg.error ? [] : msg.toolCalls.filter((tc) => tc?.name);
+  for (const tc of msg.toolCalls) tc.id ||= `call_${Math.random().toString(36).slice(2, 10)}`;
+  if (!msg.content && !msg.toolCalls.length && !msg.error && !msg.stopped)
+    msg.error = 'התקבלה תשובה ריקה. נסה שוב, או בחר מודל אחר ב-/model';
+  if (msg.stopped) state.cancel = true;
   render();
+  return msg;
+}
+
+// Answers one user message: call the model, run the tools it asks for, repeat until it just replies.
+async function runTurn(rtlHint) {
+  state.busy = true;
+  state.cancel = false;
+  state.scroll = 0;
+  try {
+    for (let step = 0; step < MAX_STEPS && !state.cancel; step++) {
+      const msg = await complete(rtlHint);
+      if (state.cancel || !msg.toolCalls.length) break;
+      const tools = msg.toolCalls.map((tc) => {
+        const tool = { role: 'tool', callId: tc.id, name: tc.name, args: {}, status: 'queued', result: 'Cancelled by the user.' };
+        try {
+          tool.args = JSON.parse(tc.arguments || '{}');
+        } catch {
+          tool.badArgs = true;
+        }
+        state.messages.push(tool);
+        return tool;
+      });
+      render();
+      for (const tool of tools) {
+        if (state.cancel) break;
+        await handleTool(tool);
+      }
+    }
+  } finally {
+    state.busy = false;
+    state.cancel = false;
+    render();
+  }
+}
+
+async function handleTool(tool) {
+  if (tool.badArgs) {
+    tool.status = 'error';
+    tool.error = 'המודל שלח פרמטרים לא תקינים';
+    tool.result = 'Error: the arguments were not valid JSON.';
+    return;
+  }
+  if (NEEDS_APPROVAL.has(tool.name) && !state.autoApprove) {
+    tool.status = 'pending';
+    const answer = await new Promise((resolve) => {
+      state.approval = { tool, resolve };
+      render();
+    });
+    state.approval = null;
+    if (answer === 'cancel') {
+      state.cancel = true;
+      tool.status = 'denied';
+      return;
+    }
+    if (answer === 'no') {
+      tool.status = 'denied';
+      tool.result = 'The user declined this action. Ask them what to do instead.';
+      return render();
+    }
+    if (answer === 'always') state.autoApprove = true;
+  }
+  tool.status = 'running';
+  tool.start = Date.now();
+  render();
+  try {
+    tool.result = await executeTool(tool);
+    tool.status = state.cancel ? 'denied' : 'done';
+  } catch (err) {
+    tool.status = 'error';
+    tool.error = err.code === 'ENOENT' ? `לא נמצא: ${tildify(resolvePath(tool.args.path))}` : err.message;
+    tool.result = `Error: ${err.message}`;
+  }
+  render();
+}
+
+// ── computer access ───────────────────────────────────────────
+
+const fn = (name, description, properties, required) => ({
+  type: 'function',
+  function: { name, description, parameters: { type: 'object', properties, required } },
+});
+const PATH = { type: 'string', description: 'File or folder path, absolute or relative to the working directory.' };
+
+const TOOLS = [
+  fn(
+    'run_command',
+    'Run a zsh command on the Mac and get its output and exit code. No stdin; `cd` persists between calls.',
+    {
+      command: { type: 'string', description: 'The shell command.' },
+      timeout_seconds: { type: 'number', description: 'Time limit in seconds (default 120, max 600).' },
+    },
+    ['command'],
+  ),
+  fn(
+    'read_file',
+    'Read a text file. Returns up to 2000 lines from `offset` (1-based).',
+    { path: PATH, offset: { type: 'number' }, limit: { type: 'number' } },
+    ['path'],
+  ),
+  fn(
+    'write_file',
+    'Create or overwrite a file with the given content. Missing parent folders are created.',
+    { path: PATH, content: { type: 'string' } },
+    ['path', 'content'],
+  ),
+  fn(
+    'edit_file',
+    'Replace one exact, unique occurrence of old_text with new_text in a file. Read the file first.',
+    { path: PATH, old_text: { type: 'string' }, new_text: { type: 'string' } },
+    ['path', 'old_text', 'new_text'],
+  ),
+  fn('list_dir', 'List the files and folders in a directory (default: the working directory).', { path: PATH }, []),
+];
+const NEEDS_APPROVAL = new Set(['run_command', 'write_file', 'edit_file']);
+
+const expandHome = (p) => (p === '~' || p.startsWith('~/') ? path.join(homedir(), p.slice(1)) : p);
+const resolvePath = (p) => path.resolve(state.cwd, expandHome(String(p ?? '.')));
+const tildify = (p) => (p === homedir() || p.startsWith(homedir() + '/') ? '~' + p.slice(homedir().length) : p);
+const displayPath = (p) => (p.startsWith(state.cwd + '/') ? p.slice(state.cwd.length + 1) : tildify(p));
+const lineCount = (n) => (n === 1 ? 'שורה אחת' : `${n} שורות`);
+const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g, '');
+
+function clip(text, max = 12000) {
+  if (text.length <= max) return text;
+  const half = Math.floor(max / 2);
+  return `${text.slice(0, half)}\n… [${text.length - max} characters cut] …\n${text.slice(-half)}`;
+}
+
+// Runs a command in zsh from the current folder; a trailer reports the final $PWD so `cd` sticks.
+function runShell(command, timeoutSec) {
+  return new Promise((resolve) => {
+    const marker = '\x1fMACCHAT_CWD:';
+    const script = `${command}\n__mc_status=$?\nprintf '\\n${marker}%s' "$PWD"\nexit $__mc_status`;
+    const child = spawn('/bin/zsh', ['-c', script], {
+      cwd: state.cwd,
+      env: { ...process.env, TERM: 'dumb', NO_COLOR: '1', PAGER: 'cat', GIT_PAGER: 'cat' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    });
+    let output = '';
+    let timedOut = false;
+    const collect = (d) => {
+      if (output.length < 2_000_000) output += d;
+    };
+    const kill = () => {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {}
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, timeoutSec * 1000);
+    state.running = { kill };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    child.on('error', (err) => (output += err.message));
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      state.running = null;
+      const i = output.lastIndexOf(marker);
+      if (i >= 0) {
+        const dir = output.slice(i + marker.length).trim();
+        if (dir) state.cwd = dir;
+        output = output.slice(0, i).replace(/\n$/, '');
+      }
+      resolve({ code, output: stripAnsi(output), timedOut });
+    });
+  });
+}
+
+async function executeTool(m) {
+  const a = m.args;
+  switch (m.name) {
+    case 'run_command': {
+      const timeout = Math.min(600, Math.max(1, Number(a.timeout_seconds) || 120));
+      const r = await runShell(String(a.command ?? ''), timeout);
+      m.output = r.output;
+      m.exitCode = r.code;
+      if (state.cancel) return 'The user stopped this command.';
+      const status = r.timedOut ? `Timed out after ${timeout}s.` : `Exit code: ${r.code}`;
+      return `${status}\nWorking directory: ${state.cwd}\n${clip(r.output) || '(no output)'}`;
+    }
+    case 'read_file': {
+      const file = resolvePath(a.path);
+      if (statSync(file).size > 5_000_000) throw new Error('The file is larger than 5 MB.');
+      const text = readFileSync(file, 'utf8');
+      if (text.includes('\0')) throw new Error('This looks like a binary file.');
+      const lines = text.split('\n');
+      const start = Math.max(1, Number(a.offset) || 1);
+      const slice = lines.slice(start - 1, start - 1 + Math.min(2000, Math.max(1, Number(a.limit) || 2000)));
+      m.summary = lineCount(lines.length);
+      return `${tildify(file)}: lines ${start}-${start + slice.length - 1} of ${lines.length}\n${clip(slice.join('\n'), 60000)}`;
+    }
+    case 'write_file': {
+      const file = resolvePath(a.path);
+      const content = String(a.content ?? '');
+      const existed = existsSync(file);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, content);
+      m.summary = `${existed ? 'עודכן' : 'נוצר'} · ${lineCount(content.split('\n').length)}`;
+      return `${existed ? 'Overwrote' : 'Created'} ${tildify(file)} (${content.split('\n').length} lines).`;
+    }
+    case 'edit_file': {
+      const file = resolvePath(a.path);
+      const text = readFileSync(file, 'utf8');
+      const oldText = String(a.old_text ?? '');
+      const count = oldText ? text.split(oldText).length - 1 : 0;
+      if (!count) throw new Error('old_text was not found in the file. Read the file and copy the text exactly.');
+      if (count > 1) throw new Error(`old_text appears ${count} times. Include more surrounding text so it is unique.`);
+      writeFileSync(file, text.replace(oldText, () => String(a.new_text ?? '')));
+      return `Edited ${tildify(file)}.`;
+    }
+    case 'list_dir': {
+      const dir = resolvePath(a.path);
+      const entries = readdirSync(dir, { withFileTypes: true }).sort(
+        (x, y) => y.isDirectory() - x.isDirectory() || x.name.localeCompare(y.name),
+      );
+      m.summary = `${entries.length} פריטים`;
+      const names = entries.slice(0, 500).map((e) => e.name + (e.isDirectory() ? '/' : ''));
+      return `${tildify(dir)} (${entries.length} entries)\n${names.join('\n')}${entries.length > 500 ? '\n…' : ''}`;
+    }
+    default:
+      throw new Error(`Unknown tool: ${m.name}`);
+  }
 }
 
 function send(text) {
   state.messages.push({ role: 'user', content: text });
-  ask(isRtl(text));
+  runTurn(isRtl(text));
 }
 
 function stop() {
+  state.cancel = true;
   state.stream?.ctrl.abort();
+  state.running?.kill();
+  state.approval?.resolve('cancel');
 }
 
 function newChat() {
@@ -766,8 +1138,15 @@ function showHelp() {
       '- שיחה חדשה — `/new`',
       '- בחירת מודל חינמי — `/model`',
       '- העתקת התשובה האחרונה — `/copy`',
+      '- אישור אוטומטי לפעולות, הפעלה וכיבוי — `/auto`',
       '- החלפת מפתח ה-API — `/key`',
       '- יציאה — `/exit`',
+      '',
+      '**גישה למחשב**',
+      '- אפשר לבקש להריץ פקודות, ליצור, לערוך ולמחוק קבצים ותיקיות, ולכתוב קוד.',
+      '- העבודה מתחילה בתיקייה שממנה הפעלת את `ai`. התיקייה הנוכחית מוצגת למעלה.',
+      '- קריאת קבצים לא דורשת אישור. כל פקודה וכל שינוי בקובץ מחכים לאישור שלך.',
+      '- באישור: y כן, n לא, a כן לכל השיחה, Esc עצירה.',
       '',
       '**מקשים**',
       '- שליחה — Enter',
@@ -791,6 +1170,12 @@ function runCommand(text) {
       return openPicker();
     case '/copy':
       return copyLast();
+    case '/auto':
+      state.autoApprove = !state.autoApprove;
+      return toast(
+        state.autoApprove ? 'אישור אוטומטי פעיל: פעולות ירוצו בלי לשאול' : '✓ אישור אוטומטי כבוי',
+        state.autoApprove ? AMBER : GREEN,
+      );
     case '/key':
       return changeKey();
     case '/help':
@@ -810,7 +1195,7 @@ function submit() {
     state.cursor = 0;
     return runCommand(text);
   }
-  if (state.stream) return toast('רגע, עוד עונה… Esc לעצירה', AMBER);
+  if (state.busy) return toast('רגע, עוד עובד… Esc לעצירה', AMBER);
   state.input = '';
   state.cursor = 0;
   send(text);
@@ -830,11 +1215,15 @@ async function loadModels() {
   );
   if (!free.some((m) => m.id === AUTO_MODEL)) free.push({ id: AUTO_MODEL });
   free.sort((a, b) => (a.id === AUTO_MODEL ? -1 : b.id === AUTO_MODEL ? 1 : a.id.localeCompare(b.id)));
-  return free.map((m) => ({
-    id: m.id,
-    label: m.id === AUTO_MODEL ? 'auto  (openrouter/free)' : m.id.replace(/:free$/, ''),
-    info: m.id === AUTO_MODEL ? he('בוחר לבד מודל חינמי פנוי') : `${Math.round((m.context_length || 0) / 1000)}K context`,
-  }));
+  return free.map((m) => {
+    const tools = m.id === AUTO_MODEL || (m.supported_parameters ?? []).includes('tools');
+    const ctx = `${Math.round((m.context_length || 0) / 1000)}K context`;
+    return {
+      id: m.id,
+      label: m.id === AUTO_MODEL ? 'auto  (openrouter/free)' : m.id.replace(/:free$/, ''),
+      info: m.id === AUTO_MODEL ? he('בוחר לבד מודל חינמי פנוי') : tools ? ctx : `${ctx} · ${he('בלי גישה למחשב')}`,
+    };
+  });
 }
 
 function openPicker() {
@@ -923,7 +1312,23 @@ function onKey(ch, k) {
     return queueRender();
   }
 
-  if (k.ctrl && k.name === 'c') return state.stream ? stop() : quit();
+  if (k.ctrl && k.name === 'c') return state.busy ? stop() : quit();
+  if (state.approval) {
+    // y/n/a also work on a Hebrew keyboard layout (ט/מ/ש).
+    const c = (ch || '').toLowerCase();
+    const answer =
+      k.name === 'return' || c === 'y' || c === 'ט'
+        ? 'yes'
+        : c === 'n' || c === 'מ'
+        ? 'no'
+        : c === 'a' || c === 'ש'
+        ? 'always'
+        : k.name === 'escape'
+        ? 'cancel'
+        : null;
+    if (answer) state.approval.resolve(answer);
+    return;
+  }
   if (k.ctrl && k.name === 'd' && !state.input) return quit();
   if (state.picker) return pickerKey(k);
 
@@ -948,7 +1353,7 @@ function onKey(ch, k) {
       insert('\n');
       break;
     case 'escape':
-      if (state.stream) stop();
+      if (state.busy) stop();
       else removeRange(0, state.input.length);
       break;
     case 'backspace':
@@ -1043,7 +1448,7 @@ function start(initialPrompt) {
     state.frame++;
     const expired = state.toast && Date.now() > state.toast.until;
     if (expired) state.toast = null;
-    if (expired || state.stream || state.picker?.loading || (!state.messages.length && !state.picker)) queueRender();
+    if (expired || state.busy || state.picker?.loading || (!state.messages.length && !state.picker)) queueRender();
   }, 80);
 
   render();
