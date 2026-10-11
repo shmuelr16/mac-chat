@@ -5,7 +5,7 @@
 // The model can run shell commands and read/write files; risky actions wait for the user's approval.
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = path.join(homedir(), '.config', 'mac-chat', 'config.json');
+const CHATS_DIR = path.join(homedir(), '.config', 'mac-chat', 'chats');
 const API = 'https://openrouter.ai/api/v1';
 const AUTO_MODEL = 'openrouter/free';
 const DEFAULT_MODEL = 'google/gemma-4-31b-it:free';
@@ -322,6 +323,7 @@ const state = {
   config: { model: DEFAULT_MODEL },
   // user/note: { content }; assistant: { content, model, toolCalls, error?, stopped? }; tool: { callId, name, args, status, result }
   messages: [],
+  chat: null, // { id, created } once the conversation has been saved
   cwd: process.cwd(),
   busy: false, // a user message is being worked on (model calls + tools)
   cancel: false,
@@ -336,7 +338,7 @@ const state = {
   maxScroll: 0,
   lastLineCount: 0,
   stream: null, // { msg, ctrl, start }
-  picker: null, // { items, index, loading, error }
+  picker: null, // { title, items: [{ id, label, info }], index, current, loading, error, onSelect, onDelete? }
   models: null,
   toast: null,
   frame: 0,
@@ -346,6 +348,7 @@ let apiKey = '';
 
 const COMMANDS = [
   ['/new', 'שיחה חדשה'],
+  ['/history', 'שיחות קודמות'],
   ['/model', 'בחירת מודל'],
   ['/copy', 'העתקת התשובה האחרונה'],
   ['/auto', 'אישור אוטומטי לפעולות'],
@@ -547,24 +550,26 @@ function splashRows(W, areaH) {
 
 function pickerRows(colW, areaH, left) {
   const p = state.picker;
-  const lines = [EMPTY, toLine([{ t: '◆ ', s: fg(PINK) }, { t: he('בחר מודל חינמי'), s: BOLD }]), EMPTY];
-  if (p.loading) lines.push(toLine([{ t: spinner() + ' ', s: fg(VIOLET) }, { t: he('טוען מודלים…'), s: DIM }]));
+  const lines = [EMPTY, toLine([{ t: '◆ ', s: fg(PINK) }, { t: he(p.title), s: BOLD }]), EMPTY];
+  if (p.loading) lines.push(toLine([{ t: spinner() + ' ', s: fg(VIOLET) }, { t: he('טוען…'), s: DIM }]));
   else if (p.error) lines.push(toLine([{ t: '✗ ', s: fg(RED) }, { t: he(p.error), s: fg(RED) }]));
+  else if (!p.items.length) lines.push(toLine([{ t: he(p.emptyText || 'אין כאן כלום עדיין'), s: DIM }]));
   else {
     const listH = Math.max(1, areaH - 6);
     const top = Math.max(0, Math.min(p.index - Math.floor(listH / 2), p.items.length - listH));
-    const nameW = Math.min(40, Math.max(...p.items.map((it) => it.label.length)));
+    const nameW = Math.min(44, colW - 30, Math.max(...p.items.map((it) => textWidth(it.label))));
     for (let i = top; i < Math.min(p.items.length, top + listH); i++) {
       const it = p.items[i];
       const sel = i === p.index;
       const base = sel ? bg(PICK_BG) + fg(WHITE) : '';
-      const name = it.label.length > nameW ? it.label.slice(0, nameW - 1) + '…' : it.label.padEnd(nameW);
+      const label = fit(it.label, nameW);
+      const deleting = p.confirmDelete === i;
       const line = toLine([
         { t: sel ? ' ❯ ' : '   ', s: base + BOLD },
-        { t: it.id === state.config.model ? '● ' : '  ', s: base + fg(GREEN) },
-        { t: name, s: base + (sel ? BOLD : '') },
+        { t: it.id === p.current ? '● ' : '  ', s: base + fg(GREEN) },
+        { t: he(label) + ' '.repeat(Math.max(0, nameW - textWidth(label))), s: base + (sel ? BOLD : '') },
         { t: '   ', s: base },
-        { t: it.info, s: base + (sel ? '' : DIM) },
+        { t: deleting ? he('Delete שוב כדי למחוק') : it.info, s: base + (deleting ? BOLD + fg(AMBER) : sel ? '' : DIM) },
       ]);
       lines.push(sel ? { s: line.s + base + ' '.repeat(Math.max(0, colW - line.w)) + RESET, w: colW } : line);
     }
@@ -576,6 +581,7 @@ function pickerRows(colW, areaH, left) {
       { t: ' ' + he('בחירה') + '    ', s: DIM },
       { t: 'Enter', s: fg(PINK) },
       { t: ' ' + he('אישור') + '    ', s: DIM },
+      ...(p.onDelete ? [{ t: 'Delete', s: fg(PINK) }, { t: ' ' + he('מחיקה') + '    ', s: DIM }] : []),
       { t: 'Esc', s: fg(PINK) },
       { t: ' ' + he('ביטול'), s: DIM },
     ]),
@@ -899,6 +905,7 @@ async function runTurn(rtlHint) {
   } finally {
     state.busy = false;
     state.cancel = false;
+    saveChat();
     render();
   }
 }
@@ -1109,7 +1116,9 @@ function stop() {
 
 function newChat() {
   stop();
+  saveChat();
   state.messages = [];
+  state.chat = null;
   state.scroll = 0;
   toast('✓ שיחה חדשה');
 }
@@ -1141,6 +1150,7 @@ function showHelp() {
     content: [
       '**פקודות**',
       '- שיחה חדשה — `/new`',
+      '- שיחות קודמות, לפתוח או למחוק — `/history`',
       '- בחירת מודל חינמי — `/model`',
       '- העתקת התשובה האחרונה — `/copy`',
       '- אישור אוטומטי לפעולות, הפעלה וכיבוי — `/auto`',
@@ -1172,8 +1182,11 @@ function runCommand(text) {
   switch (match?.[0]) {
     case '/new':
       return newChat();
+    case '/history':
+      if (state.busy) return toast('אפשר לפתוח שיחה אחרת כשהתשובה תסתיים', AMBER);
+      return openHistory();
     case '/model':
-      return openPicker();
+      return openModelPicker();
     case '/copy':
       return copyLast();
     case '/auto':
@@ -1232,32 +1245,43 @@ async function loadModels() {
   });
 }
 
-function openPicker() {
-  const focusCurrent = () => {
-    const i = state.picker.items.findIndex((it) => it.id === state.config.model);
-    state.picker.index = Math.max(0, i);
-  };
-  state.picker = { items: state.models || [], index: 0, loading: !state.models, error: null };
-  focusCurrent();
-  if (!state.models) {
-    loadModels()
-      .then((items) => {
-        state.models = items;
-        if (!state.picker) return;
-        state.picker.items = items;
-        state.picker.loading = false;
-        focusCurrent();
-      })
-      .catch(() => {
-        if (state.picker) Object.assign(state.picker, { loading: false, error: 'לא הצלחתי לטעון את רשימת המודלים' });
-      })
-      .finally(render);
-  }
+function openPicker(picker) {
+  state.picker = { index: 0, items: [], loading: false, error: null, ...picker };
+  const i = state.picker.items.findIndex((it) => it.id === state.picker.current);
+  state.picker.index = Math.max(0, i);
+}
+
+function openModelPicker() {
+  openPicker({
+    title: 'בחר מודל חינמי',
+    current: state.config.model,
+    items: state.models || [],
+    loading: !state.models,
+    onSelect: (it) => {
+      state.config.model = it.id;
+      saveConfig();
+      toast(`✓ המודל הוחלף: ${shortModel(it.id)}`);
+    },
+  });
+  if (state.models) return;
+  const picker = state.picker;
+  loadModels()
+    .then((items) => {
+      state.models = items;
+      if (state.picker !== picker) return;
+      picker.items = items;
+      picker.loading = false;
+      picker.index = Math.max(0, items.findIndex((it) => it.id === picker.current));
+    })
+    .catch(() => Object.assign(picker, { loading: false, error: 'לא הצלחתי לטעון את רשימת המודלים' }))
+    .finally(render);
 }
 
 function pickerKey(k) {
   const p = state.picker;
   const n = p.items.length;
+  const confirming = p.confirmDelete;
+  p.confirmDelete = null;
   if (k.name === 'escape') state.picker = null;
   else if (!n) return;
   else if (k.name === 'up') p.index = (p.index - 1 + n) % n;
@@ -1265,12 +1289,108 @@ function pickerKey(k) {
   else if (k.name === 'pageup') p.index = Math.max(0, p.index - 10);
   else if (k.name === 'pagedown') p.index = Math.min(n - 1, p.index + 10);
   else if (k.name === 'return') {
-    state.config.model = p.items[p.index].id;
-    saveConfig();
     state.picker = null;
-    toast(`✓ המודל הוחלף: ${shortModel(state.config.model)}`);
+    p.onSelect(p.items[p.index]);
+  } else if ((k.name === 'delete' || k.name === 'backspace') && p.onDelete) {
+    // Deleting asks for a second press on the same row.
+    if (confirming !== p.index) p.confirmDelete = p.index;
+    else {
+      p.onDelete(p.items[p.index]);
+      p.items.splice(p.index, 1);
+      p.index = Math.min(p.index, p.items.length - 1);
+    }
   }
   render();
+}
+
+// ── chat history ──────────────────────────────────────────────
+
+const countLabel = (n, one, many) => (n === 1 ? one : `${n} ${many}`);
+
+function formatDate(ts) {
+  const d = new Date(ts);
+  const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  if (d.toDateString() === new Date().toDateString()) return `היום ${time}`;
+  return `${d.getDate()}.${d.getMonth() + 1}.${String(d.getFullYear()).slice(2)} ${time}`;
+}
+
+// Saves the current conversation to ~/.config/mac-chat/chats/<id>.json (private to the user).
+function saveChat() {
+  const messages = state.messages.filter((m) => m.role !== 'note');
+  const first = messages.find((m) => m.role === 'user');
+  if (!first) return;
+  const now = Date.now();
+  state.chat ??= { id: new Date(now).toISOString().replace(/[:.]/g, '-'), created: now };
+  const chat = {
+    ...state.chat,
+    title: first.content.replace(/\s+/g, ' ').trim().slice(0, 80),
+    updated: now,
+    cwd: state.cwd,
+    messages: messages.map(({ cache, ...m }) => (m.output?.length > 20000 ? { ...m, output: m.output.slice(-20000) } : m)),
+  };
+  try {
+    mkdirSync(CHATS_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(path.join(CHATS_DIR, `${chat.id}.json`), JSON.stringify(chat), { mode: 0o600 });
+  } catch {}
+}
+
+function listChats() {
+  let files = [];
+  try {
+    files = readdirSync(CHATS_DIR).filter((f) => f.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  const chats = [];
+  for (const f of files) {
+    try {
+      chats.push(JSON.parse(readFileSync(path.join(CHATS_DIR, f), 'utf8')));
+    } catch {}
+  }
+  return chats.sort((a, b) => b.updated - a.updated);
+}
+
+function loadChat(chat) {
+  const messages = chat.messages.map((m) => ({ ...m }));
+  // A chat saved mid-turn can hold tool calls without results (or the reverse); the API rejects both.
+  const called = new Set(messages.flatMap((m) => (m.role === 'assistant' ? (m.toolCalls ?? []).map((tc) => tc.id) : [])));
+  const answered = new Set(messages.filter((m) => m.role === 'tool').map((m) => m.callId));
+  state.messages = messages.filter((m) => {
+    if (m.role === 'assistant') m.toolCalls = (m.toolCalls ?? []).filter((tc) => answered.has(tc.id));
+    if (m.role !== 'tool') return true;
+    if (['queued', 'pending', 'running'].includes(m.status)) m.status = 'denied';
+    return called.has(m.callId);
+  });
+  state.chat = { id: chat.id, created: chat.created };
+  if (chat.cwd && existsSync(chat.cwd)) state.cwd = chat.cwd;
+  state.scroll = 0;
+  state.lastLineCount = 0;
+  toast('✓ השיחה נטענה. אפשר להמשיך מאיפה שהפסקת');
+}
+
+function openHistory() {
+  openPicker({
+    title: 'שיחות קודמות',
+    emptyText: 'עוד אין שיחות שמורות',
+    current: state.chat?.id,
+    items: listChats().map((c) => ({
+      id: c.id,
+      label: c.title || 'שיחה',
+      info: he(`${formatDate(c.updated)} · ${countLabel(c.messages.filter((m) => m.role === 'user').length, 'הודעה אחת', 'הודעות')}`),
+      chat: c,
+    })),
+    onSelect: (it) => loadChat(it.chat),
+    onDelete: (it) => {
+      try {
+        rmSync(path.join(CHATS_DIR, `${it.id}.json`));
+      } catch {}
+      // Deleting the open chat also clears it from the screen, so it is not saved again.
+      if (state.chat?.id === it.id) {
+        state.chat = null;
+        state.messages = [];
+      }
+    },
+  });
 }
 
 // ── input editing ─────────────────────────────────────────────
@@ -1423,6 +1543,7 @@ function restore() {
 
 function quit() {
   stop();
+  saveChat();
   restore();
   process.exit(0);
 }
@@ -1445,7 +1566,7 @@ function onMouse(button) {
   render();
 }
 
-function start(initialPrompt) {
+function start(initialPrompt, resume) {
   // Mouse reports are taken out of the input before readline turns the rest into keypresses.
   const keys = new PassThrough();
   readline.emitKeypressEvents(keys, { escapeCodeTimeout: 50 });
@@ -1481,10 +1602,17 @@ function start(initialPrompt) {
   }, 80);
 
   render();
+  if (resume) {
+    const [latest] = listChats();
+    if (latest) loadChat(latest);
+    render();
+  }
   if (initialPrompt) send(initialPrompt);
 }
 
 const args = process.argv.slice(2);
+const resume = args[0] === '-c' || args[0] === '--continue';
+if (resume) args.shift();
 if (!stdin.isTTY || !out.isTTY) {
   console.error('mac-chat needs an interactive terminal.');
   process.exit(1);
@@ -1505,4 +1633,4 @@ if (!apiKey) {
     process.exit(1);
   }
 }
-start(args.join(' ').trim());
+start(args.join(' ').trim(), resume);

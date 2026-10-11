@@ -5,6 +5,8 @@
 צ׳אט בינה מלאכותית חינמי, ישר מהטרמינל של המק.
 מסך מלא ונקי, בלי היסטוריית גלילה, עם מודלים חינמיים של [OpenRouter](https://openrouter.ai).
 
+**יש לו גישה למחשב:** הוא מריץ פקודות, יוצר ועורך קבצים ותיקיות, וכותב קוד. כל פעולה כזו מחכה לאישור שלך. הפרטים נמצאים בסעיף [גישה למחשב](#גישה-למחשב).
+
 > **רק ל-macOS.** הכלי משתמש ב-Keychain, בחלונות של macOS וב-`pbcopy`.
 
 ![מסך הפתיחה](assets/splash.png)
@@ -19,6 +21,7 @@
 - **תשובות בזמן אמת:** התשובה נכתבת תוך כדי, עם עיצוב לכותרות, רשימות, **הדגשות** ובלוקי קוד.
 - **המפתח שמור ב-Keychain:** בהפעלה הראשונה נפתח חלון של macOS להזנת המפתח. המפתח לא נשמר בשום קובץ.
 - **גישה למחשב:** ה-AI יכול להריץ פקודות, ליצור ולערוך קבצים ותיקיות, ולכתוב קוד. כל פעולה מחכה לאישור שלך.
+- **היסטוריית שיחות:** כל שיחה נשמרת אוטומטית. אפשר לחזור לשיחה קודמת עם `/history`, או להמשיך את האחרונה עם `ai -c`.
 - **בלי תלויות:** קובץ Node אחד, בלי `npm install`.
 
 ## דרישות
@@ -70,7 +73,17 @@ ai --key
 - "מה תופס מקום בתיקיית ההורדות?"
 - "תתקן את הבאג ב-app.js ותריץ את הבדיקות"
 
-**מה הוא יכול לעשות:** להריץ פקודות zsh, לקרוא קבצים, ליצור ולערוך קבצים ותיקיות, ולראות מה יש בתיקייה.
+**מה הוא יכול לעשות:**
+
+| יכולת | שם הכלי | צריך אישור? |
+|---|---|---|
+| הרצת פקודת zsh, למשל `mkdir`, `git`, `npm`, `python3` | `run_command` | כן |
+| יצירת קובץ חדש או כתיבה מחדש של קובץ, כולל תיקיות חסרות | `write_file` | כן |
+| עריכה של חלק מקובץ קיים | `edit_file` | כן |
+| קריאת קובץ | `read_file` | לא |
+| רשימת הקבצים והתיקיות בתיקייה | `list_dir` | לא |
+
+מחיקה, העברה והעתקה של קבצים נעשות דרך `run_command`, כלומר עם `rm`, `mv` או `cp`, ולכן תמיד מחכות לאישור.
 
 **איפה:** העבודה מתחילה בתיקייה שממנה הרצת `ai`. התיקייה הנוכחית מוצגת בשורה העליונה. אם הוא מריץ `cd`, התיקייה מתעדכנת.
 
@@ -89,11 +102,26 @@ ai --key
 
 > ⚠️ ה-AI מריץ פקודות אמיתיות עם ההרשאות שלך. קרא כל פקודה לפני שאתה מאשר, במיוחד `rm`, ואל תפעיל `/auto` בתיקייה עם קבצים חשובים.
 
+## היסטוריית שיחות
+
+כל שיחה נשמרת אוטומטית בסוף כל תשובה, וגם ביציאה.
+
+- `/history`: רשימת השיחות הקודמות. Enter פותח שיחה, ואפשר להמשיך אותה מאיפה שהפסקת. כדי למחוק שיחה לוחצים Delete פעמיים.
+- `ai -c`: פותח את השיחה האחרונה. אפשר גם לשאול ישר: `ai -c "ומה עוד?"`.
+- `/new`: מתחיל שיחה חדשה. השיחה הקודמת נשארת שמורה.
+
+השיחות נשמרות כקבצי JSON ב-`~/.config/mac-chat/chats`, כולל פלט של פקודות שהורצו. הקבצים לא מוצפנים, אבל רק המשתמש שלך יכול לקרוא אותם. כדי למחוק את כל ההיסטוריה:
+
+```bash
+rm -rf ~/.config/mac-chat/chats
+```
+
 ## שימוש
 
 | פקודה | מה היא עושה |
 |---|---|
 | `/new` | שיחה חדשה |
+| `/history` | שיחות קודמות: פתיחה או מחיקה |
 | `/model` | בחירת מודל חינמי מהרשימה |
 | `/copy` | העתקת התשובה האחרונה |
 | `/auto` | אישור אוטומטי לפעולות (הפעלה/כיבוי) |
@@ -133,7 +161,7 @@ rm -rf ~/.config/mac-chat ~/mac-chat
 
 ### English
 
-A fullscreen, history-free terminal chat for **macOS only**, using free [OpenRouter](https://openrouter.ai) models. The AI can run shell commands and create or edit files and folders, and every command or file change waits for your approval. It is a single Node.js file with no dependencies. The API key is entered in a native macOS dialog and stored in the Keychain. The interface is in Hebrew, with right-to-left rendering.
+A fullscreen, history-free terminal chat for **macOS only**, using free [OpenRouter](https://openrouter.ai) models. The AI can run shell commands and create or edit files and folders, and every command or file change waits for your approval. Conversations are saved locally: use `/history` to reopen one, or `ai -c` to continue the last one. It is a single Node.js file with no dependencies. The API key is entered in a native macOS dialog and stored in the Keychain. The interface is in Hebrew, with right-to-left rendering.
 
 ```bash
 git clone https://github.com/shmuelr16/mac-chat.git ~/mac-chat && ~/mac-chat/install.sh
