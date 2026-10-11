@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { homedir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -333,6 +334,7 @@ const state = {
   lastCR: false,
   scroll: 0,
   maxScroll: 0,
+  lastLineCount: 0,
   stream: null, // { msg, ctrl, start }
   picker: null, // { items, index, loading, error }
   models: null,
@@ -492,6 +494,9 @@ function chatRows(colW, areaH, left, W) {
     if (lines.length > 1) lines.push(EMPTY);
     lines.push(...group);
   }
+  // While scrolled up, new lines arriving at the bottom must not move the view.
+  if (state.scroll > 0) state.scroll += Math.max(0, lines.length - state.lastLineCount);
+  state.lastLineCount = lines.length;
   state.maxScroll = Math.max(0, lines.length - areaH);
   state.scroll = Math.min(state.scroll, state.maxScroll);
   const start = state.maxScroll - state.scroll;
@@ -1151,7 +1156,8 @@ function showHelp() {
       '**מקשים**',
       '- שליחה — Enter',
       '- שורה חדשה — Ctrl+J',
-      '- גלילה — ↑ ↓ או הגלגלת, עמוד שלם — PgUp PgDn',
+      '- גלילה — הגלגלת או ↑ ↓, עמוד שלם — PgUp PgDn',
+      '- בחירת טקסט עם העכבר — להחזיק Fn בזמן הגרירה',
       '- עצירת תשובה — Esc',
       '- שיחה חדשה — Ctrl+L',
       '- יציאה — Ctrl+C',
@@ -1412,7 +1418,7 @@ function restore() {
   try {
     stdin.setRawMode(false);
   } catch {}
-  out.write('\x1b[?2004l\x1b[0 q\x1b[?7h\x1b[?25h\x1b[?1049l');
+  out.write('\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[0 q\x1b[?7h\x1b[?25h\x1b[?1049l');
 }
 
 function quit() {
@@ -1427,17 +1433,40 @@ function crash(err) {
   process.exit(1);
 }
 
+// SGR mouse report (enabled with ?1000h + ?1006h): ESC [ < button ; x ; y M/m
+const MOUSE_EVENT = /\x1b\[<(\d+);\d+;\d+[Mm]/g;
+
+// With mouse reporting on, the wheel scrolls the chat instead of the terminal's own scrollback.
+function onMouse(button) {
+  if (!(button & 64)) return; // clicks are ignored; only the wheel is used
+  const up = !(button & 1);
+  if (state.picker) return pickerKey({ name: up ? 'up' : 'down' });
+  scrollBy(up ? 2 : -2);
+  render();
+}
+
 function start(initialPrompt) {
-  readline.emitKeypressEvents(stdin, { escapeCodeTimeout: 50 });
-  stdin.setRawMode(true);
-  stdin.on('keypress', (ch, k) => {
+  // Mouse reports are taken out of the input before readline turns the rest into keypresses.
+  const keys = new PassThrough();
+  readline.emitKeypressEvents(keys, { escapeCodeTimeout: 50 });
+  keys.on('keypress', (ch, k) => {
     try {
       onKey(ch, k || {});
     } catch (err) {
       crash(err);
     }
   });
-  out.write('\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[5 q');
+  stdin.setRawMode(true);
+  stdin.setEncoding('utf8');
+  stdin.on('data', (data) => {
+    try {
+      const rest = data.replace(MOUSE_EVENT, (_, button) => (onMouse(Number(button)), ''));
+      if (rest) keys.write(rest);
+    } catch (err) {
+      crash(err);
+    }
+  });
+  out.write('\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[5 q');
   out.on('resize', render);
   process.on('exit', restore);
   process.on('SIGTERM', quit);
