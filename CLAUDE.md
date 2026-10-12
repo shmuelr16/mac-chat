@@ -55,3 +55,24 @@ The sections appear in this order:
 ## Style
 
 Match the existing code: 2-space indent, single quotes, small functions, and comments only where the reason is not obvious. UI strings are short Hebrew, passed through `he()`. Commit messages are in English and explain why.
+
+## Website
+
+The landing and install page lives in the private repo `shmuelr16/mac-chat-site` (local clone: `~/code/mac-chat-site`) and is deployed on Vercel at https://mac-chat-site.vercel.app. Its facts come from this `README.md`. When a feature, command, requirement or install step changes here, update the site too.
+
+## Working with the user
+
+- The user writes in Hebrew. Answer in Hebrew.
+- The user also edits files directly on GitHub. Pull before every push.
+- The shell command `mac` (in `~/.zshrc`) opens Claude Code in this repo. `mac -c` continues the last session.
+- Screenshots in `assets/` must never show the local username or a path. Crop the window title bar and tab bar out.
+- Auto mode blocks history rewrites and force pushes. Ask the user to add a rule in `/permissions`, or to run the command themselves with `!`. Remove the rule when done.
+
+## History
+
+### 2026-10-12
+
+- The title bar of `assets/splash.png` showed the local username and install path. The user asked to remove it, including from git history.
+- Cropped the title bar, tab bar and window border out of the image (now 1076×682).
+- Rewrote `main` with `git filter-branch --index-filter`, so every commit has only the cropped image. The user ran `git push --force-with-lease`. All commit SHAs changed; the new head is `ebee591`.
+- Still open: the old first commit `69235c7` is still reachable on GitHub by its SHA. Removing it needs a request to GitHub Support (https://support.github.com/request). The local clone also keeps the old history in `refs/original` and the reflog.
