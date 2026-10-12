@@ -64,7 +64,7 @@ The landing and install page lives in the private repo `shmuelr16/mac-chat-site`
 
 - The user writes in Hebrew. Answer in Hebrew.
 - The user also edits files directly on GitHub. Pull before every push.
-- The shell command `mac` (in `~/.zshrc`) opens Claude Code in this repo. `mac -c` continues the last session.
+- The shell command `mac` (in `~/.zshrc`) resumes the Claude Code session that built mac-chat, `e911f7fc-2fd4-4cb4-bf5c-0a3572b589df`. That session started in `~/code`, so it is stored under that folder and `claude -c` inside this repo does not find it.
 - Screenshots in `assets/` must never show the local username or a path. Crop the window title bar and tab bar out.
 - Auto mode blocks history rewrites and force pushes. Ask the user to add a rule in `/permissions`, or to run the command themselves with `!`. Remove the rule when done.
 
